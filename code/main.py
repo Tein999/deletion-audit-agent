@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""Ghost Data Still Exists — deterministic, evidence-backed deletion audit agent.
+
+The pipeline is intentionally reproducible and offline-first. It ingests only
+participant-facing files under dataset/, resolves current and historical
+identifiers, reconstructs point-in-time resource states, applies deletion_rules,
+and emits the exact HackerRank CSV contract. Optional LLM use is deliberately
+not required for deterministic operations or final serialization.
+"""
+from __future__ import annotations
+import argparse, csv, hashlib, json, re, sqlite3, sys
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "dataset"
+OUT = ROOT / "output.csv"
+
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+RESOURCE_ID_RE = re.compile(r"\b(?:account|search|support|analytics|telemetry|data_flow|backup|export|cache|tombstone|audit_record|marketing|delivery|attachment)[_.]\d+\b", re.I)
+PHASE_ORDER = {"FINDING": 1, "REMEDIATION": 2, "VERIFICATION": 3}
+OP_ORDER = {
+    "REPORT_REMAINING_RECORD": 1, "REPORT_EXPOSED_PII": 2,
+    "REPORT_ACTIVE_DATA_FLOW": 3, "REPORT_RESTORE_RISK": 4,
+    "DISABLE_DATA_FLOW": 1, "BLOCK_RESTORE": 2, "DELETE_RECORD": 3,
+    "REDACT_RECORD": 4, "ANONYMIZE_RECORD": 5,
+    "VERIFY_RECORD_ABSENT": 1, "VERIFY_RECORD_PRESENT": 2,
+    "VERIFY_RECORD_REDACTED": 3, "VERIFY_RECORD_ANONYMIZED": 4,
+    "VERIFY_DATA_FLOW_DISABLED": 5, "VERIFY_RESTORE_BLOCKED": 6,
+}
+SYSTEM_BY_PREFIX = {
+    "account": "account_service", "search": "search_service", "support": "support_platform",
+    "analytics": "analytics_platform", "telemetry": "analytics_platform", "data_flow": "integration_service",
+    "backup": "backup_service", "export": "export_service", "cache": "cache_service",
+    "tombstone": "identity_service", "audit_record": "security_service", "marketing": "marketing_service",
+    "delivery": "notification_service", "attachment": "support_platform",
+}
+PII_KEYS = {"email", "customer_email", "owner_email", "requester_email", "phone", "customer_phone",
+            "owner_phone", "requester_phone", "email_hash", "full_name", "name", "requester_name",
+            "display_name", "first_name", "last_name"}
+
+
+def norm(v: Any) -> str:
+    return str(v).strip().casefold() if v is not None else ""
+
+def iso(v: Any) -> datetime | None:
+    if v is None or str(v).strip() == "" or pd.isna(v): return None
+    try:
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception: return None
+
+def nonempty(v: Any) -> bool:
+    return v is not None and str(v).strip().casefold() not in {"", "none", "null", "nan", "n/a"}
+
+def flatten(obj: Any, prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, (dict, list)): out.update(flatten(v, key))
+            else: out[key.casefold()] = v
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj): out.update(flatten(v, f"{prefix}[{i}]"))
+    return out
+
+def direct_pii_fields(obj: dict[str, Any]) -> list[str]:
+    found = []
+    for key, value in flatten(obj).items():
+        leaf = key.split(".")[-1].split("[")[0].casefold()
+        is_pii = (leaf in PII_KEYS or leaf.endswith(("_email", "_phone", "_email_hash", "_name"))
+                  or leaf in {"emailhash", "phone_number", "mobile_number", "customer_name"})
+        if is_pii and nonempty(value):
+            found.append(leaf)
+    return sorted(set(found))
+
+def value_set(obj: Any) -> set[str]:
+    vals=set()
+    if isinstance(obj, dict):
+        for k,v in obj.items():
+            if isinstance(v,(dict,list)): vals |= value_set(v)
+            elif nonempty(v): vals.add(norm(v))
+    elif isinstance(obj,list):
+        for v in obj: vals |= value_set(v)
+    elif nonempty(obj): vals.add(norm(obj))
+    return vals
+
+@dataclass
+class EvidenceRecord:
+    file_id: str
+    captured_at: datetime | None
+    system_id: str
+    resource_id: str
+    category: str
+    data: dict[str, Any]
+    record_time: datetime | None = None
+    text: str = ""
+    source_type: str = "structured"
+
+    def time_ok(self, audit_at: datetime) -> bool:
+        return not ((self.captured_at and self.captured_at > audit_at) or
+                    (self.record_time and self.record_time > audit_at))
+
+
+def infer_system(resource: str, data: dict[str, Any], ancestors: list[str]) -> str:
+    flat=flatten(data)
+    for k,v in flat.items():
+        if k.split(".")[-1] in {"system_id","system","data_store","source_system","target_system","service"} and nonempty(v):
+            val=str(v).strip()
+            if val.endswith(("_service","_platform")): return val
+    normalized_resource = resource.casefold().replace(".", "_")
+    p=normalized_resource.split("_")[0]
+    if normalized_resource.startswith("data_flow_"): p="data_flow"
+    if resource.casefold().startswith("audit_record_"): p="audit_record"
+    if p in SYSTEM_BY_PREFIX: return SYSTEM_BY_PREFIX[p]
+    for a in reversed(ancestors):
+        if a.endswith(("_service","_platform")): return a
+    return "unknown_service"
+
+def infer_category(resource: str, system: str, data: dict[str, Any], ancestors: list[str]) -> str:
+    flat = flatten(data)
+    resource_l = resource.casefold()
+    raw = " ".join(ancestors).casefold() + " " + " ".join(flat.keys())
+    vals = " ".join(norm(v) for v in flat.values() if nonempty(v))
+    explicit = " ".join(norm(v) for k, v in flat.items()
+                        if k.split(".")[-1] in {"data_category", "category", "record_type"})
+    # Explicit category labels are the strongest signal.
+    for label, category in [
+        ("support_attachment", "SUPPORT_ATTACHMENT"), ("user_profile", "USER_PROFILE"),
+        ("search_index_entry", "SEARCH_INDEX_ENTRY"), ("support_message", "SUPPORT_MESSAGE"),
+        ("analytics_profile", "ANALYTICS_PROFILE"), ("product_telemetry", "PRODUCT_TELEMETRY"),
+        ("account_tombstone", "ACCOUNT_TOMBSTONE"), ("security_audit_log", "SECURITY_AUDIT_LOG"),
+        ("legal_hold_record", "LEGAL_HOLD_RECORD"), ("data_flow", "DATA_FLOW"),
+        ("backup_archive", "BACKUP_ARCHIVE"), ("user_export", "USER_EXPORT"),
+        ("marketing_profile", "MARKETING_PROFILE"), ("email_delivery_log", "EMAIL_DELIVERY_LOG")]:
+        if label in explicit:
+            return category
+    # Resource namespaces and owning systems outrank broad parent collection names.
+    if resource_l.startswith("account_") or system == "account_service": return "USER_PROFILE"
+    if resource_l.startswith("search_") or system == "search_service": return "SEARCH_INDEX_ENTRY"
+    if resource_l.startswith("analytics_") or system == "analytics_platform": return "ANALYTICS_PROFILE"
+    if resource_l.startswith("telemetry_"): return "PRODUCT_TELEMETRY"
+    if resource_l.startswith("tombstone_") or "deleted_customer_references" in raw: return "ACCOUNT_TOMBSTONE"
+    if resource_l.startswith("audit_record_") or "security_audit" in raw or system == "security_service": return "SECURITY_AUDIT_LOG"
+    if resource_l.startswith("data_flow_") or system == "integration_service" or any(x in raw for x in ("connector", "subscription", "integration")): return "DATA_FLOW"
+    if resource_l.startswith("backup_") or system == "backup_service" or "backup" in raw or "restore" in raw: return "BACKUP_ARCHIVE"
+    if resource_l.startswith("export_") or system == "export_service" or "customer_exports" in raw: return "USER_EXPORT"
+    if resource_l.startswith("cache_") or system == "cache_service": return "CACHE_ENTRY"
+    if resource_l.startswith("marketing_") or system == "marketing_service" or "marketing" in raw: return "MARKETING_PROFILE"
+    if resource_l.startswith("delivery_") or system == "notification_service" or "notification" in raw: return "EMAIL_DELIVERY_LOG"
+    if "attachment" in raw or "attachment" in vals or "attachment" in str(flat.get("document_name", "")).casefold(): return "SUPPORT_ATTACHMENT"
+    if resource_l.startswith("support_") or system == "support_platform":
+        # Shared conversations are retained/redacted; support contact indexes and lookup
+        # artifacts are deleted as secondary identifiers.
+        if any(k.endswith(("message_excerpt", "conversation", "ticket_body", "thread_text")) for k in flat):
+            return "SUPPORT_MESSAGE"
+        if any(x in vals for x in ("identifiable", "redacted", "shared_conversation")):
+            return "SUPPORT_MESSAGE"
+        if "contact_query" in vals or "legacy_contact_index" in vals or "support_replica" in " ".join(ancestors).casefold():
+            return "SECONDARY_IDENTIFIER"
+        return "SUPPORT_MESSAGE"
+    if "legal_hold" in raw or "legal_hold" in explicit: return "LEGAL_HOLD_RECORD"
+    return "SECONDARY_IDENTIFIER"
+
+class Auditor:
+    def __init__(self, data_dir: Path):
+        self.data_dir=data_dir
+        self.requests=pd.read_csv(data_dir/"deletion_requests.csv",keep_default_na=False)
+        self.identities=pd.read_csv(data_dir/"user_identities.csv",keep_default_na=False)
+        self.audit=pd.read_csv(data_dir/"user_audit_log.csv",keep_default_na=False)
+        self.activity=pd.read_csv(data_dir/"system_activity.csv",keep_default_na=False)
+        self.rules=pd.read_csv(data_dir/"deletion_rules.csv",keep_default_na=False)
+        self.manifest=pd.read_csv(data_dir/"evidence_files.csv",keep_default_na=False)
+        self.identity_by_email: dict[str,str]={}
+        self.aliases: dict[str,set[str]]=defaultdict(set)
+        self.identity_by_uid: dict[str,dict[str,str]]={}
+        self._build_identity_index()
+        self.evidence_records=self._load_evidence()
+        self.records_by_resource=defaultdict(list)
+        for record in self.evidence_records:
+            self.records_by_resource[record.resource_id].append(record)
+        self.activity_rows=[]
+        for activity in self.activity.itertuples(index=False):
+            event_time=iso(activity.event_time)
+            if event_time:
+                self.activity_rows.append((event_time, str(activity.target_system), str(activity.resource_id)))
+        self.snapshot_scopes=self._load_snapshot_scopes()
+
+    def _build_identity_index(self):
+        # Current identifiers win over historical aliases if a value was ever reused.
+        current_email = {}
+        historical_email = {}
+        for _, r in self.identities.iterrows():
+            uid = str(r.user_id)
+            fields = {k: norm(r[k]) for k in ("name", "email", "phone", "email_hash")
+                      if k in r and nonempty(r[k])}
+            self.identity_by_uid[uid] = fields
+            self.aliases[uid].add(norm(uid))
+            for value in fields.values():
+                self.aliases[uid].add(value)
+            if fields.get("email"):
+                current_email[fields["email"]] = uid
+        for _, r in self.audit.iterrows():
+            uid = str(r.user_id)
+            field = str(r.field_name).casefold()
+            for k in ("old_value", "new_value"):
+                if nonempty(r[k]):
+                    value = norm(r[k])
+                    self.aliases[uid].add(value)
+                    if field == "email":
+                        historical_email[value] = uid
+        self.identity_by_email = {**historical_email, **current_email}
+        # Historical and current email hashes are useful in downstream stores.
+        for uid, vals in self.aliases.items():
+            for value in list(vals):
+                if EMAIL_RE.fullmatch(value):
+                    self.aliases[uid].add(hashlib.sha256(value.encode()).hexdigest())
+
+    def resolve(self,email: str) -> str | None:
+        return self.identity_by_email.get(norm(email))
+
+    def _load_evidence(self) -> list[EvidenceRecord]:
+        out = []
+        for _, m in self.manifest.iterrows():
+            path = self.data_dir / str(m.file_path)
+            if not path.exists():
+                continue
+            fid, cap, suffix = str(m.file_id), iso(m.captured_at), path.suffix.lower()
+            if suffix == ".json":
+                try:
+                    out.extend(self._walk_json(json.loads(path.read_text(encoding="utf-8")), fid, cap))
+                except Exception:
+                    continue
+            elif suffix == ".sql":
+                out.extend(self._read_sql(path, fid, cap))
+            elif suffix in {".log", ".txt"}:
+                out.extend(self._read_text(path.read_text(encoding="utf-8", errors="ignore"), fid, cap, path.name))
+            elif suffix == ".pdf":
+                try:
+                    import fitz
+                    content = "\n".join(page.get_text() for page in fitz.open(path))
+                except Exception:
+                    content = ""
+                # PDFs are multi-page business artifacts. Keep the complete text together so
+                # an identity on page 1 can be linked to a resource ID on page 2.
+                ids = sorted({x.replace(".", "_") for x in RESOURCE_ID_RE.findall(content)}, key=lambda x: (x.split("_")[0], x))
+                if ids:
+                    for rid in ids:
+                        prefix = "data_flow" if rid.startswith("data_flow_") else rid.split("_")[0].casefold()
+                        system = SYSTEM_BY_PREFIX.get(prefix, "unknown_service")
+                        category = infer_category(rid, system, {"document_name": path.name, "document_text": content}, [path.name])
+                        out.append(EvidenceRecord(fid, cap, system, rid, category,
+                                                  {"resource_id": rid, "document_name": path.name,
+                                                   "document_text": content}, cap, content, "pdf"))
+                else:
+                    out.extend(self._read_text(content, fid, cap, path.name))
+            elif suffix in {".png", ".jpg", ".jpeg"}:
+                try:
+                    from PIL import Image
+                    import pytesseract
+                    content = pytesseract.image_to_string(Image.open(path))
+                except Exception:
+                    content = ""
+                ids = sorted({x.replace(".", "_") for x in RESOURCE_ID_RE.findall(content)})
+                for rid in ids:
+                    prefix = "data_flow" if rid.startswith("data_flow_") else rid.split("_")[0].casefold()
+                    system = SYSTEM_BY_PREFIX.get(prefix, "unknown_service")
+                    category = infer_category(rid, system, {"document_name": path.name, "document_text": content}, [path.name])
+                    associated_text = content
+                    emails = EMAIL_RE.findall(content)
+                    if len(ids) == len(emails) and len(ids) > 1:
+                        associated_text = f"{rid} {emails[ids.index(rid)]}"
+                    extra = {"resource_id": rid, "document_name": path.name,
+                             "document_text": associated_text}
+                    if category == "DATA_FLOW" and any(x in content.casefold() for x in ("healthy", "continuous")):
+                        extra["status"] = "healthy"
+                        extra["enabled"] = True
+                    out.append(EvidenceRecord(fid, cap, system, rid, category,
+                                              extra, cap, associated_text, "image_ocr"))
+                if not ids:
+                    out.extend(self._read_text(content, fid, cap, path.name))
+        return out
+
+    def _walk_json(self,obj,file_id,cap,ancestors=None):
+        out=[]; ancestors=ancestors or []
+        if isinstance(obj,dict):
+            rid=obj.get("resource_id") or obj.get("record_id")
+            if nonempty(rid) and RESOURCE_ID_RE.fullmatch(str(rid)):
+                data=dict(obj)
+                sysid=infer_system(str(rid),data,ancestors)
+                cat=infer_category(str(rid),sysid,data,ancestors)
+                flat=flatten(data); rt=None
+                for k,v in flat.items():
+                    if k.split(".")[-1] in {"observed_at","captured_at","updated_at","recorded_at","event_time","created_at","timestamp"} and nonempty(v):
+                        rt=iso(v)
+                        if rt: break
+                out.append(EvidenceRecord(file_id,cap,sysid,str(rid),cat,data,rt,source_type="json"))
+            for k,v in obj.items():
+                if isinstance(v,(dict,list)): out.extend(self._walk_json(v,file_id,cap,ancestors+[str(k).casefold()]))
+        elif isinstance(obj,list):
+            for v in obj: out.extend(self._walk_json(v,file_id,cap,ancestors))
+        return out
+
+    def _read_sql(self,p,file_id,cap):
+        out=[]
+        try:
+            con=sqlite3.connect(":memory:"); con.executescript(p.read_text(encoding="utf-8",errors="ignore"))
+            tables=[x[0] for x in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            for table in tables:
+                if table=="snapshot_scope": continue
+                cols=[x[1] for x in con.execute(f'PRAGMA table_info("{table}")')]
+                for row in con.execute(f'SELECT * FROM "{table}"'):
+                    d=dict(zip(cols,row)); rid=d.get("resource_id")
+                    if not nonempty(rid) or not RESOURCE_ID_RE.fullmatch(str(rid)): continue
+                    # JSON payload columns are common in consolidated replicas.
+                    for k,v in list(d.items()):
+                        if isinstance(v,str) and v[:1] in "{[":
+                            try: d[k]=json.loads(v)
+                            except Exception: pass
+                    sysid=infer_system(str(rid),d,[table]); cat=infer_category(str(rid),sysid,d,[table])
+                    rt=None
+                    for k in ("updated_at","observed_at","recorded_at","event_time"):
+                        if d.get(k): rt=iso(d[k]); break
+                    out.append(EvidenceRecord(file_id,cap,sysid,str(rid),cat,d,rt,source_type="sql"))
+            con.close()
+        except Exception:
+            out.extend(self._read_text(p.read_text(encoding="utf-8",errors="ignore"),file_id,cap,p.name))
+        return out
+
+    def _read_text(self,content,file_id,cap,filename):
+        out=[]
+        for line in content.splitlines():
+            if not line.strip(): continue
+            # Structured handover rows use pipe-delimited fields.
+            parts=[x.strip() for x in line.split("|")]
+            mtime=iso(parts[0]) if parts else None
+            rid=None; sysid=None; cat=None; state=None
+            if len(parts)>=6 and parts[1].endswith(("_service","_platform")) and RESOURCE_ID_RE.fullmatch(parts[2]):
+                sysid=parts[1]; rid=parts[2]; cat=parts[3].upper(); state=parts[4].upper()
+                data={"resource_id":rid,"system_id":sysid,"data_category":cat,"status":state,"line":line,"subject":parts[5]}
+            else:
+                # Prefer the actual resource_id key. Never mistake account_service for account_123.
+                kv=dict((k.casefold(),v.strip('"\'')) for k,v in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s,|]+)",line))
+                rid=kv.get("resource_id") or kv.get("resource")
+                if not (rid and RESOURCE_ID_RE.fullmatch(rid)):
+                    matches=RESOURCE_ID_RE.findall(line)
+                    rid=matches[0] if matches else None
+                if not rid: continue
+                rid = rid.replace(".", "_")
+                prefix = "data_flow" if rid.startswith("data_flow_") else rid.split("_")[0].casefold()
+                sysid=kv.get("service") or kv.get("system") or SYSTEM_BY_PREFIX.get(prefix,"unknown_service")
+                if sysid in {"support_replica", "attachment_preview"}: sysid = "support_platform"
+                data={"resource_id":rid,"system_id":sysid,"line":line,**kv}
+                # Add common status and identifier tokens from free-text diagnostics.
+                for k in ("email","lookup_key","customer_email","customer_reference","subject_reference","user_id","owner_email","requester_email","phone","email_hash","enabled","restore_allowed","result","rows","http_status","last_delivery_status"):
+                    if k not in data:
+                        mm=re.search(rf"\b{k}=([^\s,|]+)",line,re.I)
+                        if mm: data[k]=mm.group(1).strip('"\'')
+                cat=infer_category(rid,sysid,data,[filename])
+                if "contact_lookup_completed" in line.casefold() or "contact_query_completed" in line.casefold():
+                    cat="SECONDARY_IDENTIFIER"
+            if cat not in {"USER_PROFILE","SECONDARY_IDENTIFIER","SEARCH_INDEX_ENTRY","CACHE_ENTRY","SUPPORT_MESSAGE","SUPPORT_ATTACHMENT","ANALYTICS_PROFILE","PRODUCT_TELEMETRY","USER_EXPORT","MARKETING_PROFILE","EMAIL_DELIVERY_LOG","SECURITY_AUDIT_LOG","LEGAL_HOLD_RECORD","BACKUP_ARCHIVE","ACCOUNT_TOMBSTONE","DATA_FLOW"}:
+                cat=infer_category(rid,sysid,data,[filename])
+            # Timestamp at start of a log line or embedded timestamp.
+            if not mtime:
+                mm=re.search(r"20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z",line)
+                mtime=iso(mm.group(0)) if mm else None
+            out.append(EvidenceRecord(file_id,cap,sysid,rid,cat,data,mtime,line,"text"))
+        # Join multi-line trace events by trace_id. This is required when a lookup key
+        # appears on the request-start line and its resource_id appears on completion.
+        trace_groups = defaultdict(list)
+        for line in content.splitlines():
+            tm = re.search(r"\btrace_id=([^\s,|]+)", line, re.I)
+            if tm:
+                trace_groups[tm.group(1).strip('"\'')].append(line)
+        for trace_id, lines in trace_groups.items():
+            joined = "\n".join(lines)
+            ids = sorted({x.replace(".", "_") for x in RESOURCE_ID_RE.findall(joined)})
+            if not ids:
+                continue
+            kv = {}
+            for k, v in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s,|]+)", joined):
+                kv[k.casefold()] = v.strip('"\'')
+            mtimes = [iso(m.group(0)) for m in re.finditer(r"20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z", joined)]
+            mtime = max((x for x in mtimes if x), default=None)
+            for rid in ids:
+                prefix = "data_flow" if rid.startswith("data_flow_") else rid.split("_")[0].casefold()
+                system = kv.get("service") or kv.get("system") or SYSTEM_BY_PREFIX.get(prefix, "unknown_service")
+                if system in {"support_replica", "attachment_preview"}: system = "support_platform"
+                data = {"resource_id": rid, "system_id": system, **kv, "trace_text": joined}
+                category = infer_category(rid, system, data, [filename])
+                if "contact_lookup_completed" in joined.casefold() or "contact_query_completed" in joined.casefold():
+                    category = "SECONDARY_IDENTIFIER"
+                out.append(EvidenceRecord(file_id, cap, system, rid, category, data, mtime, joined, "trace"))
+        return out
+
+    def _load_snapshot_scopes(self):
+        scopes=[]
+        for _,m in self.manifest.iterrows():
+            p=self.data_dir/str(m.file_path)
+            if p.suffix.lower()!=".sql" or not p.exists(): continue
+            try:
+                con=sqlite3.connect(":memory:"); con.executescript(p.read_text(errors="ignore"))
+                if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshot_scope'").fetchone():
+                    for sysid,ts in con.execute("SELECT origin_system,captured_at FROM snapshot_scope"):
+                        scopes.append((str(m.file_id),str(sysid),iso(ts) or iso(m.captured_at)))
+                con.close()
+            except Exception: pass
+        return scopes
+
+    def _request_authorizes_delete(self, text: str) -> bool:
+        t = norm(text)
+        # Explicit non-deletion requests override incidental deletion-related wording.
+        no_patterns = [
+            r"\bdo not delete\b", r"\bdon't delete\b", r"\bnot requesting (?:an? )?deletion\b",
+            r"\bdata access request\b", r"\baccess my data\b", r"\bcorrect my (?:name|email|details)\b",
+            r"\bupdate my (?:name|email|details)\b", r"\bchange my (?:name|email|details)\b",
+            r"\bunsubscribe\b", r"\bopt[- ]?out\b", r"\bstop (?:sending|using) (?:me )?marketing\b",
+            r"\bkeep my account\b", r"\bdo not close my account\b"
+        ]
+        if any(re.search(p, t) for p in no_patterns):
+            return False
+        patterns = [
+            r"\bdelet(?:e|ed|es|ing|ion|ions)\b", r"\beras(?:e|ed|ure)\b", r"\bpurge\b",
+            r"\bremove\b.{0,100}\b(account|profile|personal details|personal data|records|record|search result|contact details|name|data)\b",
+            r"\b(account|profile|personal data|personal details)\b.{0,100}\b(remove|remov(?:e|ed|al)|erase|delet(?:e|ed|ion)|purge)\b",
+            r"\bclose\b.{0,50}\b(account|profile|it)\b", r"\b(account|profile)\b.{0,50}\bclos(?:e|ed|ure)\b",
+            r"\bwould like it closed\b", r"\bno longer need this account\b",
+            r"\baccount itself is gone\b", r"\binternal deleted-account record\b",
+            r"\bverify that my account was deleted\b", r"\bconfirm that the account was fully removed\b",
+            r"\bcheck the latest state\b", r"\baudit the deletion\b", r"\bprofile is gone\b",
+            r"\bclean my personal details out\b", r"\bremove records linked\b",
+            r"\bsuppression de mon compte\b", r"\bsuppression définitive\b", r"\bsuppression\b",
+            r"\beliminaci[oó]n\b", r"\beliminar mi cuenta\b", r"\bexclus[aã]o\b", r"\bexcluir minha conta\b",
+            r"削除", r"アカウント.{0,20}削除", r"영구 삭제", r"계정.{0,20}삭제"
+        ]
+        return any(re.search(p, t) for p in patterns)
+
+    def _match_record(self,r:EvidenceRecord,uid:str,aliases:set[str])->bool:
+        vals=value_set(r.data)
+        if norm(uid) in vals or bool(aliases & vals): return True
+        # Text matching uses exact token boundaries for non-email aliases; email addresses are exact.
+        txt=r.text.casefold()
+        for a in aliases:
+            if not a or len(a)<5: continue
+            if EMAIL_RE.fullmatch(a):
+                if a in txt: return True
+            elif re.search(rf"(?<![\w]){re.escape(a)}(?![\w])",txt): return True
+        return False
+
+    def _status_text(self,r:EvidenceRecord)->str:
+        flat=flatten(r.data)
+        vals=[]
+        for k,v in flat.items():
+            leaf=k.split(".")[-1]
+            if leaf in {"status","result","enabled","restore_allowed","http_status","status_code","account_status","last_delivery_status","state","rows","total_hits","download_available","email_opt_in","event","eligible","deletion_block"} and nonempty(v):
+                vals.append(f"{leaf}={norm(v)}")
+        return " ".join(vals)
+
+    def _account_absence(self,uid:str,audit_at:datetime)->tuple[str,str]|None:
+        # Point-in-time SQL snapshots declare the systems they cover. A complete account
+        # snapshot with no matching profile is negative evidence for account absence.
+        candidates=[(fid,ts) for fid,sysid,ts in self.snapshot_scopes if sysid=="account_service" and ts and ts<=audit_at]
+        if not candidates: return None
+        fid,ts=max(candidates,key=lambda x:x[1])
+        # Prefer a known account id from identity-linked profile lookup evidence.
+        uid_num=re.search(r"(\d+)$",uid)
+        rid=f"account_{int(uid_num.group(1)):03d}" if uid_num else ""
+        if not rid: return None
+        # If a matching account record exists in that snapshot, it is not absent.
+        snap_records=[r for r in self.evidence_records if r.file_id==fid and r.system_id=="account_service" and r.resource_id==rid]
+        if snap_records: return None
+        return rid,fid
+
+    def _activity_resource_links(self, row, audit_at: datetime) -> list[str]:
+        """Correlate a small set of operational resource IDs to the request timeline.
+
+        Activity events are hints only; a linked resource is accepted only when a
+        separate evidence artifact contains it and proves its state.
+        """
+        requested = iso(row.requested_at) or audit_at
+        reported = iso(row.reported_at) or requested
+        text = norm(row.request_text)
+        hints = {
+            "analytics_platform": any(k in text for k in ("analytics", "statistics", "identifiable", "point back to me",
+                                                               "remaining records cannot identify me", "current and historical identifiers",
+                                                               "identifiants actuels et antérieurs")),
+            "integration_service": any(k in text for k in ("integration", "sync", "synchron", "connector", "copy them", "send my data", "recreate")),
+            "backup_service": any(k in text for k in ("backup", "restore", "archive")),
+        }
+        from datetime import timedelta
+        best = {}
+        for event_time, system, resource_id in self.activity_rows:
+            if event_time > audit_at or not hints.get(system, False):
+                continue
+            delta = abs((event_time - reported).total_seconds())
+            if delta > 90 * 60 or event_time < requested - timedelta(hours=1):
+                continue
+            old = best.get(system)
+            if old is None or (delta, resource_id) < old:
+                best[system] = (delta, resource_id)
+        return [best[system][1] for system in sorted(best)]
+
+    def audit_case(self,row)->tuple[str,list[dict]]:
+        audit_at=iso(row.audit_at) or datetime.max.replace(tzinfo=timezone.utc)
+        if not self._request_authorizes_delete(row.request_text): return "NOT_APPLICABLE",[]
+        uid=self.resolve(row.email)
+        if not uid:
+            # No subject could be resolved, so do not claim deletion or invent findings.
+            # Schedule a future account lookup keyed by the request email at the account service.
+            step={"step_no":1,"phase":"VERIFICATION","system_id":"account_service",
+                  "resource_id":"account_lookup_by_request_email","operation":"VERIFY_RECORD_ABSENT",
+                  "state":"ABSENT","evidence_id":""}
+            return "INCOMPLETE",[step]
+        aliases=set(self.aliases.get(uid,set())); aliases.add(norm(row.email))
+        matched=[r for r in self.evidence_records if r.time_ok(audit_at) and self._match_record(r,uid,aliases)]
+        linked_candidates = self._activity_resource_links(row, audit_at)
+        directly_matched_systems={x.system_id for x in matched}
+        linked_ids = {rid for rid in linked_candidates
+                      if (SYSTEM_BY_PREFIX.get("data_flow" if rid.startswith("data_flow_") else rid.split("_")[0], "unknown_service") not in directly_matched_systems)}
+        existing_keys={(x.system_id,x.resource_id) for x in matched}
+        for resource_id in linked_ids:
+            for record in self.records_by_resource.get(resource_id, []):
+                if record.time_ok(audit_at) and (record.system_id,record.resource_id) not in existing_keys:
+                    matched.append(record)
+                    existing_keys.add((record.system_id,record.resource_id))
+        # Keep latest observation; merge equal-time duplicates rather than dropping fields.
+        latest={}
+        for r in matched:
+            key=(r.system_id,r.resource_id)
+            rank=(r.record_time or r.captured_at or datetime.min.replace(tzinfo=timezone.utc),r.captured_at or datetime.min.replace(tzinfo=timezone.utc))
+            old=latest.get(key)
+            oldrank=((old.record_time or old.captured_at or datetime.min.replace(tzinfo=timezone.utc)),(old.captured_at or datetime.min.replace(tzinfo=timezone.utc))) if old else None
+            if old is None or rank>oldrank:
+                latest[key]=r
+            elif rank==oldrank:
+                merged=dict(old.data)
+                for k,v in r.data.items():
+                    if k not in merged or not nonempty(merged.get(k)):
+                        merged[k]=v
+                latest[key]=EvidenceRecord(old.file_id, old.captured_at, old.system_id, old.resource_id,
+                                           old.category, merged, old.record_time, old.text + "\n" + r.text, old.source_type)
+        recs=list(latest.values())
+        findings=[]; remediations=[]; verifications=[]
+        account_seen=False
+        for r in recs:
+            cat=r.category; fields=direct_pii_fields(r.data); flat=flatten(r.data); status=self._status_text(r)
+            rid=r.resource_id; sysid=r.system_id; eid=r.file_id
+            # Normalize explicit status tokens for point-in-time evidence.
+            absent=("404" in status or any(x in status for x in ("not_found","not found","absent","rows 0","result=miss")))
+            if cat=="USER_PROFILE":
+                account_seen=True
+                profile_status = status
+                if "profile_lookup_started" in norm(r.text) and "profile_lookup_completed" not in norm(r.text):
+                    continue
+                if absent or "not_found" in profile_status or "not found" in profile_status or "404" in profile_status or ("profile" in flat and flat.get("profile") is None):
+                    verifications.append(("VERIFY_RECORD_ABSENT",sysid,rid,"ABSENT",eid))
+                else:
+                    findings.append(("REPORT_REMAINING_RECORD",sysid,rid,"PRESENT",eid))
+                    remediations.append(("DELETE_RECORD",sysid,rid,"ABSENT",""))
+                    verifications.append(("VERIFY_RECORD_ABSENT",sysid,rid,"ABSENT",""))
+            elif cat in {"SECONDARY_IDENTIFIER","SEARCH_INDEX_ENTRY","CACHE_ENTRY","USER_EXPORT","MARKETING_PROFILE","SUPPORT_ATTACHMENT"}:
+                # A readback explicitly reporting no hit/zero rows is negative evidence.
+                hit_absent=absent or ("total_hits" in flat and str(flat.get("total_hits"))=="0") or ("result" in flat and norm(flat.get("result")) in {"miss","not_found","absent"})
+                if hit_absent: verifications.append(("VERIFY_RECORD_ABSENT",sysid,rid,"ABSENT",eid))
+                else:
+                    findings.append(("REPORT_REMAINING_RECORD",sysid,rid,"PRESENT",eid))
+                    remediations.append(("DELETE_RECORD",sysid,rid,"ABSENT",""))
+                    verifications.append(("VERIFY_RECORD_ABSENT",sysid,rid,"ABSENT",""))
+            elif cat=="SUPPORT_MESSAGE":
+                # A status of IDENTIFIABLE is evidence of exposure even when the artifact
+                # stores the subject only in free text rather than a named JSON field.
+                direct_aliases=[a for a in aliases if EMAIL_RE.fullmatch(a) or re.fullmatch(r"\+?[0-9][0-9 ()-]{7,}", a)]
+                text_has_direct=any(a in r.text.casefold() for a in direct_aliases)
+                redacted_state=any(x in status for x in ("redacted", "anonymized", "anonymised"))
+                exposed = (bool(fields) or text_has_direct or any(x in status for x in ("identifiable", "present", "found", "contains_pii"))) and not redacted_state
+                if exposed:
+                    findings.append(("REPORT_EXPOSED_PII",sysid,rid,"PRESENT",eid))
+                    remediations.append(("REDACT_RECORD",sysid,rid,"REDACTED",""))
+                    verifications.append(("VERIFY_RECORD_REDACTED",sysid,rid,"REDACTED",""))
+                else: verifications.append(("VERIFY_RECORD_REDACTED",sysid,rid,"REDACTED",eid))
+            elif cat in {"ANALYTICS_PROFILE","PRODUCT_TELEMETRY"}:
+                exposed = bool(fields) or any(x in status for x in ("identifiable", "attributable", "present", "found", "active"))
+                if exposed:
+                    findings.append(("REPORT_EXPOSED_PII",sysid,rid,"PRESENT",eid))
+                    remediations.append(("ANONYMIZE_RECORD",sysid,rid,"ANONYMIZED",""))
+                    verifications.append(("VERIFY_RECORD_ANONYMIZED",sysid,rid,"ANONYMIZED",""))
+                else: verifications.append(("VERIFY_RECORD_ANONYMIZED",sysid,rid,"ANONYMIZED",eid))
+            elif cat=="DATA_FLOW":
+                enabled_value=norm(flat.get("enabled", ""))
+                delivery_value=norm(flat.get("last_delivery_status", ""))
+                raw_state=norm(flat.get("status", flat.get("state", "")))
+                active=(enabled_value in {"true", "1", "yes"} or delivery_value in {"delivered", "success", "active"}
+                        or raw_state in {"active", "enabled", "healthy", "continuous"}
+                        or bool(re.search(r"\b(healthy|continuous|scheduler_registered=true)\b",status)))
+                disabled=(enabled_value in {"false", "0", "no"} or delivery_value in {"stopped", "disabled"}
+                          or raw_state in {"disabled", "stopped", "inactive"})
+                if active:
+                    findings.append(("REPORT_ACTIVE_DATA_FLOW",sysid,rid,"ACTIVE",eid))
+                    remediations.append(("DISABLE_DATA_FLOW",sysid,rid,"DISABLED",""))
+                    verifications.append(("VERIFY_DATA_FLOW_DISABLED",sysid,rid,"DISABLED",""))
+                elif disabled: verifications.append(("VERIFY_DATA_FLOW_DISABLED",sysid,rid,"DISABLED",eid))
+            elif cat=="BACKUP_ARCHIVE":
+                restore_value = norm(flat.get("restore_allowed", ""))
+                eligible_value=norm(flat.get("eligible", "")); block_value=norm(flat.get("deletion_block", ""))
+                active=restore_value in {"true", "1", "yes"} or bool(re.search(r"\b(active|restorable|can_restore)\b",status)) or (eligible_value in {"true","1"} and block_value in {"false","0"})
+                blocked=restore_value in {"false", "0", "no"} or bool(re.search(r"\b(blocked|disabled|not_restorable)\b",status))
+                if active:
+                    findings.append(("REPORT_RESTORE_RISK",sysid,rid,"ACTIVE",eid))
+                    remediations.append(("BLOCK_RESTORE",sysid,rid,"BLOCKED",""))
+                    verifications.append(("VERIFY_RESTORE_BLOCKED",sysid,rid,"BLOCKED",""))
+                elif blocked: verifications.append(("VERIFY_RESTORE_BLOCKED",sysid,rid,"BLOCKED",eid))
+            elif cat=="SECURITY_AUDIT_LOG":
+                verifications.append(("VERIFY_RECORD_PRESENT",sysid,rid,"PRESENT",eid))
+            elif cat=="LEGAL_HOLD_RECORD":
+                verifications.append(("VERIFY_RECORD_PRESENT",sysid,rid,"PRESENT",eid))
+            elif cat=="ACCOUNT_TOMBSTONE":
+                if fields or any(x in status for x in ("identifiable", "pii_present")):
+                    findings.append(("REPORT_EXPOSED_PII",sysid,rid,"PRESENT",eid))
+                    remediations.append(("REDACT_RECORD",sysid,rid,"REDACTED",""))
+                    verifications.append(("VERIFY_RECORD_REDACTED",sysid,rid,"REDACTED",""))
+                else: verifications.append(("VERIFY_RECORD_REDACTED",sysid,rid,"REDACTED",eid))
+            elif cat=="EMAIL_DELIVERY_LOG":
+                if fields:
+                    findings.append(("REPORT_EXPOSED_PII",sysid,rid,"PRESENT",eid))
+                    remediations.append(("REDACT_RECORD",sysid,rid,"REDACTED",""))
+                    verifications.append(("VERIFY_RECORD_REDACTED",sysid,rid,"REDACTED",""))
+        # If there is a complete account snapshot and no profile, record its negative proof.
+        if not account_seen:
+            absent=self._account_absence(uid,audit_at)
+            if absent:
+                rid,eid=absent
+                verifications.append(("VERIFY_RECORD_ABSENT","account_service",rid,"ABSENT",eid))
+                account_seen=True
+        # If a concrete account record is absent, incomplete cases still need a future check
+        # for that account in the final plan (evidence_id blank by contract).
+        if findings and not account_seen:
+            uid_num=re.search(r"(\d+)$",uid)
+            if uid_num:
+                rid=f"account_{int(uid_num.group(1)):03d}"
+                verifications.append(("VERIFY_RECORD_ABSENT","account_service",rid,"ABSENT",""))
+        def dedup(xs):
+            d={}
+            for x in xs: d[x[:4]]=x
+            return list(d.values())
+        findings=dedup(findings); remediations=dedup(remediations); verifications=dedup(verifications)
+        incomplete=bool(findings)
+        if not verifications and not findings:
+            incomplete=True
+            uid_num=re.search(r"(\d+)$",uid)
+            fallback_rid=f"account_{int(uid_num.group(1)):03d}" if uid_num else "account_lookup_by_request_email"
+            verifications.append(("VERIFY_RECORD_ABSENT","account_service",fallback_rid,"ABSENT",""))
+        steps=[]
+        if incomplete:
+            for op,s,rid,state,eid in sorted(findings,key=lambda x:(OP_ORDER[x[0]],x[1],x[2])):
+                steps.append(("FINDING",s,rid,op,state,eid))
+            for op,s,rid,state,eid in sorted(remediations,key=lambda x:(OP_ORDER[x[0]],x[1],x[2])):
+                steps.append(("REMEDIATION",s,rid,op,state,eid))
+            for op,s,rid,state,eid in sorted(verifications,key=lambda x:(OP_ORDER[x[0]],x[1],x[2])):
+                steps.append(("VERIFICATION",s,rid,op,state,""))
+        else:
+            for op,s,rid,state,eid in sorted(verifications,key=lambda x:(OP_ORDER[x[0]],x[1],x[2])):
+                if eid: steps.append(("VERIFICATION",s,rid,op,state,eid))
+            if not steps: incomplete=True
+        status="INCOMPLETE" if incomplete else "COMPLETE"
+        objects=[{"step_no":i,"phase":phase,"system_id":s,"resource_id":rid,"operation":op,"state":state,"evidence_id":eid}
+                 for i,(phase,s,rid,op,state,eid) in enumerate(steps,1)]
+        return status,objects
+
+    def run(self,output_path:Path=OUT):
+        rows=[]
+        for row in self.requests.itertuples(index=False):
+            status,steps=self.audit_case(row)
+            rows.append({"case_id":row.case_id,"deletion_status":status,"steps_json":json.dumps(steps,separators=(",",":"),ensure_ascii=False)})
+        out=pd.DataFrame(rows).sort_values("case_id",key=lambda s:s.str.extract(r"(\d+)")[0].astype(int))
+        self.validate(out)
+        output_path.parent.mkdir(parents=True,exist_ok=True)
+        out.to_csv(output_path,index=False,quoting=csv.QUOTE_MINIMAL)
+        return out
+
+    @staticmethod
+    def validate(df):
+        """Validate the output contract without assuming a fixed input row count."""
+        assert list(df.columns)==["case_id","deletion_status","steps_json"]
+        assert df.case_id.is_unique
+        assert set(df.deletion_status)<={"COMPLETE","INCOMPLETE","NOT_APPLICABLE"}
+        assert list(df.case_id)==sorted(df.case_id,key=lambda x:int(re.search(r"\d+",x).group()))
+        for row in df.itertuples(index=False):
+            steps=json.loads(row.steps_json); assert isinstance(steps,list)
+            if row.deletion_status=="NOT_APPLICABLE": assert not steps
+            last=0
+            for i,s in enumerate(steps,1):
+                assert s["step_no"]==i
+                assert s["phase"] in PHASE_ORDER and s["operation"] in OP_ORDER
+                assert set(s)=={"step_no","phase","system_id","resource_id","operation","state","evidence_id"}
+                if s["phase"]=="FINDING": assert s["evidence_id"]
+                if row.deletion_status=="COMPLETE": assert s["phase"]=="VERIFICATION" and s["evidence_id"]
+                if row.deletion_status=="INCOMPLETE" and s["phase"]!="FINDING": assert s["evidence_id"]==""
+                assert PHASE_ORDER[s["phase"]]>=last; last=PHASE_ORDER[s["phase"]]
+
+
+def compare_sample(data_dir:Path):
+    gold=pd.read_csv(data_dir/"sample_output.csv",keep_default_na=False)
+    a=Auditor(data_dir); req=pd.read_csv(data_dir/"sample_deletion_requests.csv",keep_default_na=False)
+    pred={}
+    for r in req.itertuples(index=False):
+        st,steps=a.audit_case(r); pred[r.case_id]=(st,steps)
+    status_ok=0; exact=0; field_total=0; field_ok=0; step_pos_ok=0; expected_steps=0
+    failures=[]
+    for r in gold.itertuples(index=False):
+        ps,pp=pred[r.case_id]; gs=r.deletion_status; gp=json.loads(r.steps_json)
+        status_ok+=ps==gs; exact+=pp==gp
+        if ps!=gs or pp!=gp: failures.append({"case_id":r.case_id,"expected_status":gs,"predicted_status":ps,"expected_steps":len(gp),"predicted_steps":len(pp)})
+        for i,exp in enumerate(gp):
+            expected_steps+=1
+            if i<len(pp):
+                got=pp[i]
+                for k in ("phase","system_id","resource_id","operation","state","evidence_id"):
+                    field_total+=1; field_ok+=got.get(k)==exp.get(k)
+                step_pos_ok+=all(got.get(k)==exp.get(k) for k in ("phase","system_id","resource_id","operation","state","evidence_id"))
+            else: field_total+=6
+    n=len(gold)
+    return {"sample_cases":n,"status_correct":status_ok,"status_accuracy":status_ok/n,
+            "exact_sequence_correct":exact,"sequence_accuracy":exact/n,"step_position_accuracy":step_pos_ok/max(1,expected_steps),
+            "field_accuracy":field_ok/max(1,field_total),"failures":failures}
+
+
+def main():
+    ap=argparse.ArgumentParser(description="Audit deletion requests against evidence and policy")
+    ap.add_argument("--dataset",type=Path,default=DATA); ap.add_argument("--output",type=Path,default=OUT)
+    ap.add_argument("--evaluate-samples",action="store_true"); ap.add_argument("--json-report",type=Path)
+    args=ap.parse_args(); auditor=Auditor(args.dataset); result=auditor.run(args.output)
+    print(f"Wrote {len(result)} cases to {args.output}")
+    print("Status counts:",result.deletion_status.value_counts().to_dict())
+    if args.evaluate_samples:
+        report=compare_sample(args.dataset); print("Sample evaluation:",json.dumps(report,indent=2))
+        if args.json_report: args.json_report.write_text(json.dumps(report,indent=2),encoding="utf-8")
+
+if __name__=="__main__": main()
